@@ -29,7 +29,6 @@ class CaptiEngine:
         self.model = AutoModel(
             model="iic/SenseVoiceSmall",
             vad_model="fsmn-vad",
-            punc_model="ct-punc",
             spk_model="cam++",
             device=device,
             disable_update=True,
