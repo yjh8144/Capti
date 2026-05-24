@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  funasr:
+    image: registry.cn-hangzhou.aliyuncs.com/funasr/funasr:funasr-runtime-sdk-gpu-0.4.5
+    container_name: funasr-server
+    ports:
+      - "10095:10095"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./models:/workspace/models
+    command: >
+      bash -c "cd /workspace/FunASR/runtime &&
+      nohup bash run_server.sh
+      --download-model-dir /workspace/models
+      --vad-dir damo/speech_fsmn_vad_zh-cn-16k-common-onnx
+      --model-dir damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx
+      --punc-dir damo/punc_ct-transformer_cn-en-common-vocab471067-large-onnx
+      --spk-dir damo/speech_campplus_sv_zh-cn_16k-common
+      --port 10095"
+    restart: unless-stopped
