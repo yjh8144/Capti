@@ -1,196 +1,63 @@
 """
-Capti Server - 实时语音识别服务端
-组合方案：pyannote 3.1（说话人分段+重叠检测）+ FunASR Paraformer（ASR）
+Capti Server v1 - 实时语音识别服务端（简化版）
+使用 FunASR（Paraformer + VAD + 标点 + 说话人分离）
 
-依赖安装：
-pip install funasr pyannote.audio torch torchaudio websockets numpy
-
-首次运行需要 HuggingFace token（用于下载 pyannote 模型）：
-export HF_TOKEN=your_huggingface_token
+启动方式：
+  python capti_server.py --device cuda:0 --port 10095
 """
 
 import asyncio
 import json
 import logging
 import numpy as np
-import torch
-import torchaudio
-from collections import defaultdict
-from dataclasses import dataclass, asdict
-from enum import Enum
-from typing import Optional
+import sys
 
 import websockets
 from funasr import AutoModel
-from pyannote.audio import Pipeline as PyannotePipeline
-from pyannote.audio.pipelines.utils.hook import ProgressHook
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("capti-server")
 
 
-class LatencyMode(Enum):
-    LOW = "low"          # ~1s 延迟，流式直出，说话人分离精度较低
-    MEDIUM = "medium"    # ~3s 延迟，滑动窗口，说话人分离精度较好
-    HIGH = "high"        # ~5s 延迟，较大窗口，说话人标注最准确
-
-
-@dataclass
-class CaptionResult:
-    text: str
-    speaker_id: int
-    is_final: bool
-    is_overlap: bool = False
-    timestamp_start: float = 0.0
-    timestamp_end: float = 0.0
-
-
 class CaptiEngine:
-    def __init__(self, device: str = "cuda:0", latency_mode: LatencyMode = LatencyMode.MEDIUM):
+    def __init__(self, device: str = "cuda:0"):
         self.device = device
-        self.latency_mode = latency_mode
         self.sample_rate = 16000
 
-        logger.info("Loading FunASR models...")
-        self.asr_model = AutoModel(
-            model="paraformer-zh-streaming",
+        logger.info("Loading FunASR models (this may download models on first run)...")
+
+        self.model = AutoModel(
+            model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
             vad_model="fsmn-vad",
             punc_model="ct-punc",
+            spk_model="cam++",
             device=device,
         )
 
-        self.asr_offline = AutoModel(
-            model="paraformer-zh",
-            vad_model="fsmn-vad",
-            punc_model="ct-punc",
-            device=device,
-        )
+        logger.info("All models loaded successfully.")
 
-        logger.info("Loading pyannote pipeline...")
-        self.diarization = PyannotePipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1"
-        )
-        self.diarization.to(torch.device(device))
-
-        logger.info("All models loaded.")
-
-    def get_window_size(self) -> float:
-        if self.latency_mode == LatencyMode.LOW:
-            return 1.0
-        elif self.latency_mode == LatencyMode.MEDIUM:
-            return 3.0
-        else:
-            return 5.0
-
-    def get_step_size(self) -> float:
-        if self.latency_mode == LatencyMode.LOW:
-            return 0.5
-        elif self.latency_mode == LatencyMode.MEDIUM:
-            return 1.5
-        else:
-            return 2.5
-
-    async def process_window(self, audio_data: np.ndarray) -> list[CaptionResult]:
-        """处理一个音频窗口，返回识别结果列表"""
-        if len(audio_data) < self.sample_rate * 0.3:
-            return []
-
-        waveform = torch.from_numpy(audio_data).unsqueeze(0).float()
-
-        # 说话人分段
-        diarization_result = self.diarization(
-            {"waveform": waveform, "sample_rate": self.sample_rate}
-        )
-
-        results = []
-        for turn, _, speaker in diarization_result.itertracks(yield_label=True):
-            start_sample = int(turn.start * self.sample_rate)
-            end_sample = int(turn.end * self.sample_rate)
-
-            if end_sample - start_sample < int(0.2 * self.sample_rate):
-                continue
-
-            segment_audio = audio_data[start_sample:end_sample]
-            segment_text = self._transcribe(segment_audio)
-
-            if segment_text.strip():
-                speaker_id = int(speaker.split("_")[-1]) if "_" in speaker else 0
-                results.append(CaptionResult(
-                    text=segment_text,
-                    speaker_id=speaker_id,
-                    is_final=True,
-                    is_overlap=False,
-                    timestamp_start=turn.start,
-                    timestamp_end=turn.end,
-                ))
-
-        # 检测重叠段
-        overlap_timeline = diarization_result.get_overlap()
-        for segment in overlap_timeline:
-            start_sample = int(segment.start * self.sample_rate)
-            end_sample = int(segment.end * self.sample_rate)
-
-            if end_sample - start_sample < int(0.2 * self.sample_rate):
-                continue
-
-            segment_audio = audio_data[start_sample:end_sample]
-            segment_text = self._transcribe(segment_audio)
-
-            if segment_text.strip():
-                results.append(CaptionResult(
-                    text=segment_text,
-                    speaker_id=-1,
-                    is_final=True,
-                    is_overlap=True,
-                    timestamp_start=segment.start,
-                    timestamp_end=segment.end,
-                ))
-
-        results.sort(key=lambda r: r.timestamp_start)
-        return results
-
-    def _transcribe(self, audio: np.ndarray) -> str:
-        """对一段音频进行 ASR"""
+    def transcribe(self, audio_data: np.ndarray) -> list[dict]:
+        """对一段音频进行 ASR + 说话人分离"""
         try:
-            res = self.asr_offline.generate(
-                input=audio,
+            res = self.model.generate(
+                input=audio_data,
                 batch_size_s=0,
-                is_final=True,
             )
             if res and len(res) > 0:
-                return res[0].get("text", "")
+                return res
         except Exception as e:
             logger.error(f"ASR error: {e}")
-        return ""
-
-    async def process_streaming(self, audio_chunk: np.ndarray, cache: dict) -> Optional[str]:
-        """流式 ASR（低延迟模式下直接出文字，不分说话人）"""
-        try:
-            chunk_size = [0, 10, 5]
-            res = self.asr_model.generate(
-                input=audio_chunk,
-                cache=cache,
-                is_final=False,
-                chunk_size=chunk_size,
-                encoder_chunk_look_back=4,
-                decoder_chunk_look_back=1,
-            )
-            if res and len(res) > 0:
-                text = res[0].get("text", "")
-                if text.strip():
-                    return text
-        except Exception as e:
-            logger.error(f"Streaming ASR error: {e}")
-        return None
+        return []
 
 
 class ClientSession:
-    def __init__(self, engine: CaptiEngine):
+    def __init__(self, engine: CaptiEngine, window_seconds: float = 5.0, step_seconds: float = 2.0):
         self.engine = engine
         self.audio_buffer = np.array([], dtype=np.float32)
-        self.stream_cache = {}
+        self.window_seconds = window_seconds
+        self.step_seconds = step_seconds
         self.last_process_pos = 0
-        self.speaker_map = {}
+        self.processed_text = ""
 
     def feed_audio(self, pcm_bytes: bytes):
         """接收 PCM 16-bit 音频数据"""
@@ -198,88 +65,110 @@ class ClientSession:
         self.audio_buffer = np.concatenate([self.audio_buffer, samples])
 
     def should_process(self) -> bool:
-        step_samples = int(self.engine.get_step_size() * self.engine.sample_rate)
+        step_samples = int(self.step_seconds * self.engine.sample_rate)
         return len(self.audio_buffer) - self.last_process_pos >= step_samples
 
-    async def process(self) -> list[CaptionResult]:
-        window_samples = int(self.engine.get_window_size() * self.engine.sample_rate)
+    async def process(self) -> list[dict]:
+        window_samples = int(self.window_seconds * self.engine.sample_rate)
         window_start = max(0, len(self.audio_buffer) - window_samples)
         window_audio = self.audio_buffer[window_start:]
 
         self.last_process_pos = len(self.audio_buffer)
 
-        results = await self.engine.process_window(window_audio)
+        if len(window_audio) < self.engine.sample_rate * 0.5:
+            return []
 
-        # 保留最近 30 秒的音频，防止内存无限增长
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, self.engine.transcribe, window_audio
+        )
+
+        output = []
+        for item in results:
+            text = item.get("text", "")
+            if not text.strip():
+                continue
+
+            # FunASR spk_model 返回的说话人信息
+            spk_info = item.get("spk", None)
+            sentence_info = item.get("sentence_info", None)
+
+            if sentence_info:
+                # 按句子分段，每句带说话人标签
+                for sent in sentence_info:
+                    sent_text = sent.get("text", "")
+                    spk_id = sent.get("spk", 0)
+                    if sent_text.strip():
+                        output.append({
+                            "text": sent_text,
+                            "speaker_id": spk_id,
+                            "is_final": True,
+                            "is_overlap": False,
+                        })
+            else:
+                output.append({
+                    "text": text,
+                    "speaker_id": 0,
+                    "is_final": True,
+                    "is_overlap": False,
+                })
+
+        # 保留最近 30 秒的音频
         max_keep = 30 * self.engine.sample_rate
         if len(self.audio_buffer) > max_keep:
             self.audio_buffer = self.audio_buffer[-max_keep:]
             self.last_process_pos = len(self.audio_buffer)
 
-        return results
+        return output
 
-    async def process_streaming_chunk(self, pcm_bytes: bytes) -> Optional[str]:
-        """流式模式下直接出文字"""
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        return await self.engine.process_streaming(samples, self.stream_cache)
+    async def process_final(self) -> list[dict]:
+        """处理剩余音频"""
+        if len(self.audio_buffer) - self.last_process_pos < self.engine.sample_rate * 0.3:
+            return []
+        return await self.process()
 
 
 async def handle_client(websocket, engine: CaptiEngine):
     """处理一个客户端连接"""
-    session = ClientSession(engine)
-    latency_mode = engine.latency_mode
-    logger.info(f"Client connected, latency mode: {latency_mode.value}")
+    window_seconds = 5.0
+    step_seconds = 2.0
+    session = ClientSession(engine, window_seconds, step_seconds)
+    logger.info(f"Client connected from {websocket.remote_address}")
 
     try:
         async for message in websocket:
             if isinstance(message, str):
-                # JSON 控制消息
                 try:
                     config = json.loads(message)
-                    if "latency_mode" in config:
-                        mode_str = config["latency_mode"]
-                        latency_mode = LatencyMode(mode_str)
-                        engine_copy = engine
-                        logger.info(f"Latency mode changed to: {mode_str}")
+                    # 客户端可设置延迟模式
+                    latency = config.get("latency_mode", "medium")
+                    if latency == "low":
+                        session.window_seconds = 2.0
+                        session.step_seconds = 1.0
+                    elif latency == "medium":
+                        session.window_seconds = 5.0
+                        session.step_seconds = 2.0
+                    elif latency == "high":
+                        session.window_seconds = 8.0
+                        session.step_seconds = 3.0
+
                     if config.get("is_speaking") is False:
-                        # 客户端结束说话，处理剩余音频
-                        if len(session.audio_buffer) > 0:
-                            results = await session.process()
-                            for r in results:
-                                await websocket.send(json.dumps(asdict(r), ensure_ascii=False))
+                        results = await session.process_final()
+                        for r in results:
+                            await websocket.send(json.dumps(r, ensure_ascii=False))
                 except json.JSONDecodeError:
                     pass
             else:
                 # 二进制音频数据
-                if latency_mode == LatencyMode.LOW:
-                    # 低延迟：流式直出
-                    session.feed_audio(message)
-                    text = await session.process_streaming_chunk(message)
-                    if text:
-                        result = CaptionResult(
-                            text=text,
-                            speaker_id=0,
-                            is_final=False,
-                            is_overlap=False,
-                        )
-                        await websocket.send(json.dumps(asdict(result), ensure_ascii=False))
-
-                    # 同时后台做说话人分段
-                    if session.should_process():
-                        results = await session.process()
-                        for r in results:
-                            r.is_final = True
-                            await websocket.send(json.dumps(asdict(r), ensure_ascii=False))
-                else:
-                    # 中/高延迟：窗口处理
-                    session.feed_audio(message)
-                    if session.should_process():
-                        results = await session.process()
-                        for r in results:
-                            await websocket.send(json.dumps(asdict(r), ensure_ascii=False))
+                session.feed_audio(message)
+                if session.should_process():
+                    results = await session.process()
+                    for r in results:
+                        await websocket.send(json.dumps(r, ensure_ascii=False))
 
     except websockets.exceptions.ConnectionClosed:
-        logger.info("Client disconnected")
+        logger.info(f"Client disconnected: {websocket.remote_address}")
+    except Exception as e:
+        logger.error(f"Error handling client: {e}")
 
 
 async def main():
@@ -287,23 +176,19 @@ async def main():
     parser = argparse.ArgumentParser(description="Capti Server")
     parser.add_argument("--host", default="0.0.0.0", help="绑定地址")
     parser.add_argument("--port", type=int, default=10095, help="端口")
-    parser.add_argument("--device", default="cuda:0", help="GPU设备")
-    parser.add_argument("--latency", default="medium", choices=["low", "medium", "high"],
-                        help="延迟模式: low(~1s), medium(~3s), high(~5s)")
+    parser.add_argument("--device", default="cuda:0", help="GPU设备 (cuda:0, cuda:1, ...)")
     args = parser.parse_args()
 
-    engine = CaptiEngine(
-        device=args.device,
-        latency_mode=LatencyMode(args.latency),
-    )
+    engine = CaptiEngine(device=args.device)
 
-    logger.info(f"Starting server on {args.host}:{args.port}")
+    logger.info(f"Server starting on ws://{args.host}:{args.port}")
     async with websockets.serve(
         lambda ws: handle_client(ws, engine),
         args.host,
         args.port,
         max_size=10 * 1024 * 1024,
     ):
+        logger.info("Server ready. Waiting for connections...")
         await asyncio.Future()
 
 
