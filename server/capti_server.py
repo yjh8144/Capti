@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import numpy as np
+import os
 import sys
 
 import websockets
@@ -26,10 +27,15 @@ class CaptiEngine:
 
         logger.info("Loading FunASR models (this may download models on first run)...")
 
+        # 使用本地路径（如果已手动下载）或模型ID（自动下载）
+        model_dir = os.path.expanduser("~/.cache/modelscope/hub/models/iic/SenseVoiceSmall")
+        vad_dir = os.path.expanduser("~/.cache/modelscope/hub/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch")
+        spk_dir = os.path.expanduser("~/.cache/modelscope/hub/models/iic/speech_campplus_sv_zh-cn_16k-common")
+
         self.model = AutoModel(
-            model="iic/SenseVoiceSmall",
-            vad_model="fsmn-vad",
-            spk_model="cam++",
+            model=model_dir if os.path.isdir(model_dir) else "iic/SenseVoiceSmall",
+            vad_model=vad_dir if os.path.isdir(vad_dir) else "fsmn-vad",
+            spk_model=spk_dir if os.path.isdir(spk_dir) else "cam++",
             device=device,
             disable_update=True,
         )
