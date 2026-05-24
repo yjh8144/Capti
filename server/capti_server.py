@@ -27,11 +27,12 @@ class CaptiEngine:
         logger.info("Loading FunASR models (this may download models on first run)...")
 
         self.model = AutoModel(
-            model="iic/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+            model="iic/SenseVoiceSmall",
             vad_model="fsmn-vad",
             punc_model="ct-punc",
             spk_model="cam++",
             device=device,
+            disable_update=True,
         )
 
         logger.info("All models loaded successfully.")
